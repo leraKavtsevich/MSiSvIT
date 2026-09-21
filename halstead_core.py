@@ -87,7 +87,12 @@ def tokenize(code: str):
 
     while pos < n:
         # regex-литерал: '/' там, где ожидается операнд
-        if code[pos] == "/" and _looks_like_regex_start(prev_significant):
+        # (но не для '//' и '/*' — это начало комментария, а не пустой regex)
+        if (
+            code[pos] == "/"
+            and code[pos:pos + 2] not in ("//", "/*")
+            and _looks_like_regex_start(prev_significant)
+        ):
             m = _match_regex_literal(code, pos)
             if m:
                 tokens.append(Token("REGEX", m))
@@ -226,39 +231,115 @@ def _collect_function_names(tokens):
     return names
 
 
-def _is_math_grouping_paren(tokens, idx):
+def _find_matching_close(tokens, open_idx):
+    """Находит индекс парной закрывающей скобки для tokens[open_idx]
+    (любая из '(' '[' '{'), учитывая вложенность всех трёх типов скобок."""
+    openers = {"(", "[", "{"}
+    closers = {")", "]", "}"}
+    if tokens[open_idx].kind != "PUNCT" or tokens[open_idx].text not in openers:
+        return None
+    depth = 0
+    for k in range(open_idx, len(tokens)):
+        tk = tokens[k]
+        if tk.kind != "PUNCT":
+            continue
+        if tk.text in openers:
+            depth += 1
+        elif tk.text in closers:
+            depth -= 1
+            if depth == 0:
+                return k
+    return None
+
+
+def _paren_role(tokens, idx):
     """
-    True  — '(' группирует подвыражение         => оператор '( )'.
-    False — '(' часть вызова/конструкции/params => не считается.
+    Определяет роль пары '( )', начинающейся в tokens[idx]. Используется и
+    для решения "считать ли '( )' оператором", и для решения "считать ли
+    запятые внутри неё оператором".
+
+    Возвращает одну из строк:
+      'group'        — группировка подвыражения: (2 + 3) * (4 - 1)
+                        => '( )' считается оператором; запятая внутри —
+                        оператор (настоящая запятая-последовательность).
+      'control'      — часть if(...)/while(...)/for(...)/switch(...)/catch(...)
+                        => '( )' НЕ оператор; запятая внутри — оператор
+                        (если это не список объявлений — это отдельно
+                        отслеживается через decl_stack в analyze()).
+      'params'       — список параметров function(...) / именованной функции
+                        => '( )' НЕ оператор; запятая — НЕ оператор (разделитель).
+      'arrow-params' — список параметров стрелочной функции (a, b) => ...
+                        => '( )' НЕ оператор; запятая — НЕ оператор.
+      'call'         — вызов функции foo(...), foo()(...), arr[i](...)
+                        => '( )' НЕ оператор; запятая — НЕ оператор (разделитель
+                        аргументов).
     """
+    # 1) стрелочная функция: сразу после закрывающей ')' идёт '=>'
+    close_idx = _find_matching_close(tokens, idx)
+    if close_idx is not None and close_idx + 1 < len(tokens):
+        nxt = tokens[close_idx + 1]
+        if nxt.kind == "MULTIOP" and nxt.text == "=>":
+            return "arrow-params"
+
     j = idx - 1
     if j < 0:
-        return True
+        return "group"
 
     prev = tokens[j]
 
-    # после идентификатора
     if prev.kind == "IDENT":
-        # if(...) while(...) for(...) switch(...) catch(...) function(...)
-        if prev.text in PAREN_ATTACHED_KEYWORDS:
-            return False
+        if prev.text in ("function", "func"):
+            return "params"
+        if prev.text in PAREN_ATTACHED_KEYWORDS:   # if/while/for/switch/catch
+            return "control"
         if prev.text in LITERAL_KEYWORDS:
-            return False
+            return "call"
         if prev.text in DECLARATIONS:
-            return False
-        # вызов функции foo(...)
-        return False
+            return "params"
+        # обычный вызов функции foo(...)
+        return "call"
 
     # после ')' — вызов результата: foo()()
     if prev.kind == "PUNCT" and prev.text == CLOSE_PAREN:
-        return False
+        return "call"
 
     # после ']' — вызов результата индекса: arr[i]()
     if prev.kind == "PUNCT" and prev.text == CLOSE_BRACKET:
-        return False
+        return "call"
 
     # после операторов/открывающих скобок/запятой/точки с запятой — группировка
-    return True
+    return "group"
+
+
+def _brace_role(tokens, idx):
+    """
+    Определяет роль '{': 'object' (литерал объекта или деструктуризация)
+    или 'block' (тело функции/блок конструкции). Нужно только чтобы решить,
+    являются ли запятые внутри разделителями свойств (не оператор) или
+    потенциальной запятой-последовательностью в блоке (оператор, редкий
+    случай). Само '{ }' по-прежнему всегда считается одним оператором —
+    это правило не меняется.
+    """
+    j = idx - 1
+    if j < 0:
+        return "block"
+
+    prev = tokens[j]
+
+    if prev.kind == "PUNCT" and prev.text in ("=", "(", "[", ",", ":"):
+        return "object"
+    if prev.kind == "MULTIOP":
+        if prev.text == "=>":
+            return "block"      # тело стрелочной функции по умолчанию — блок
+        return "object"          # после += === && и т.п. ожидается выражение
+    if prev.kind == "IDENT":
+        if prev.text in ("return", "typeof", "yield", "await", "in", "of",
+                          "new", "delete", "instanceof"):
+            return "object"
+        return "block"            # else/try/finally/do и произвольные метки
+    if prev.kind == "PUNCT" and prev.text == CLOSE_PAREN:
+        return "block"             # if(...) {  while(...) {  function(...) {
+    return "block"
 
 
 def _is_ternary_colon(tokens, idx):
