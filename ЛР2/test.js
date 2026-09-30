@@ -59,6 +59,7 @@ function maxMark(list, subject) {
     return best;
 }
 
+
 let debtors = 0;
 for (const student of students) {
     const avg = average(student.marks);
